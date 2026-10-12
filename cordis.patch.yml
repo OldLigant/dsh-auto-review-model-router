@@ -1,10 +1,17 @@
-# Inserted by this bundle. `config` is omitted so the plugin's own defaults
-# apply; override any field from your profile's cordis.patch.yml, e.g.
+# The row a profile needs. It is only applied automatically when this package is
+# listed in a profile's `dsh.profile.bundles`; an ordinary install (pnpm add, or
+# a link: dependency) needs this row copied into the profile patch layer:
 #
-# - id: auto-review-model-router
-#   config:
-#     reviewModel: deepseek-official/deepseek-flash
+#   # <profile>/cordis.patch.yml
+#   - insert:
+#       - id: auto-review-model-router
+#         name: dsh-auto-review-model-router
+#         config:
+#           reviewModel: deepseek-official/deepseek-flash
 #
+# The row carries no `config` here, so the plugin's own defaults apply:
+# reviewModel is deepseek-official/deepseek-flash, which is also what the
+# commented example above states explicitly.
 - insert:
     - id: auto-review-model-router
       name: dsh-auto-review-model-router
