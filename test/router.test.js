@@ -8,10 +8,12 @@ import { test } from 'node:test'
 
 import {
   AUTO_REVIEW_SYSTEM_PREFIX,
+  RETRYABLE_FAILURE_CODES,
   TEST_UNMARKED_LOOP_MARK,
   compilePattern,
   isAutoReviewRequest,
   isLoopRequest,
+  isRetryableFailure,
   methodOwner,
   parseRoute,
   resolveConfig,
@@ -53,10 +55,37 @@ test('resolveConfig defaults to the DeepSeek flash review route', () => {
   const resolved = resolveConfig()
   assert.deepEqual(resolved.route, route)
   assert.deepEqual(resolved.patterns, [{ kind: 'literal', value: AUTO_REVIEW_SYSTEM_PREFIX }])
+  assert.equal(resolved.retryAttempts, 4)
+  assert.equal(resolved.retryDelayMs, 500)
   assert.equal(resolved.wrapPrepareCall, true)
   assert.equal(resolved.dropReasoningEffort, true)
   assert.equal(resolved.dropMaxTokens, true)
   assert.equal(resolved.logRetargets, true)
+})
+
+test('resolveConfig validates the retry controls', () => {
+  assert.equal(resolveConfig({ retryAttempts: 0 }).retryAttempts, 0)
+  assert.equal(resolveConfig({ retryAttempts: 10 }).retryAttempts, 10)
+  assert.equal(resolveConfig({ retryDelayMs: 0 }).retryDelayMs, 0)
+  assert.throws(() => resolveConfig({ retryAttempts: 11 }), /between 0 and 10/u)
+  assert.throws(() => resolveConfig({ retryAttempts: -1 }), /between 0 and 10/u)
+  assert.throws(() => resolveConfig({ retryAttempts: 1.5 }), /between 0 and 10/u)
+  assert.throws(() => resolveConfig({ retryAttempts: '4' }), /between 0 and 10/u)
+  assert.throws(() => resolveConfig({ retryDelayMs: -1 }), /non-negative/u)
+  assert.throws(() => resolveConfig({ retryDelayMs: 1.5 }), /non-negative/u)
+})
+
+test('isRetryableFailure retries only the harness-transient codes', () => {
+  assert.deepEqual([...RETRYABLE_FAILURE_CODES], ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TRANSPORT'])
+  for (const code of RETRYABLE_FAILURE_CODES) {
+    assert.equal(isRetryableFailure({ code, message: code }), true, code)
+  }
+  // `TIMEOUT` is the adapter's idle watchdog: retrying multiplies a silent wait.
+  for (const code of ['TIMEOUT', 'ABORTED', 'AUTH', 'INVALID_CREDENTIAL', 'NO_ADAPTER', 'UNSUPPORTED_REASONING_EFFORT']) {
+    assert.equal(isRetryableFailure({ code, message: code }), false, code)
+  }
+  assert.equal(isRetryableFailure({ code: 'TRANSPORT', message: 'x' }, new AbortController().signal), true)
+  assert.equal(isRetryableFailure({ code: 'TRANSPORT', message: 'x' }, AbortSignal.abort()), false)
 })
 
 test('resolveConfig treats an empty reviewModel as routing disabled', () => {

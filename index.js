@@ -68,6 +68,39 @@ const DEFAULT_DROP_REASONING_EFFORT = true
 const DEFAULT_DROP_MAX_TOKENS = true
 const DEFAULT_LOG_RETARGETS = true
 
+/**
+ * Retries after the first attempt of one review call. The built-in auto-review
+ * calls `llm.stream` directly, outside the agent loop, so the harness retry
+ * plugin (`llm-retry`, an `agent/request-error` listener) never sees it: a
+ * transient transport failure denies the tool call instead of being retried.
+ */
+const DEFAULT_RETRY_ATTEMPTS = 4
+
+/** Pause before each retry, in milliseconds. */
+const DEFAULT_RETRY_DELAY_MS = 500
+
+/** Upper bound on {@link Config} `retryAttempts`, so a typo cannot spin forever. */
+const MAX_RETRY_ATTEMPTS = 10
+
+/**
+ * Request signals with a retry loop already running. Auto-review reuses one
+ * signal for its whole review, so an outer `llm.stream` wrapper can recognize a
+ * request the inner wrapper is already retrying and dispatch it once instead of
+ * multiplying the attempt count.
+ */
+const RETRYING_SIGNALS = new WeakSet()
+
+/**
+ * Failure codes worth retrying, matching the harness's own
+ * `DEFAULT_RETRYABLE_CODES` (`dsh-llm` `retry-policy.ts`).
+ *
+ * `TIMEOUT` is deliberately absent: the DeepSeek adapter raises it from an IDLE
+ * WATCHDOG, so retrying it multiplies the silent wait by the attempt count while
+ * the auto-review deadline silently drains. `ABORTED` is the deadline or the
+ * caller cancelling, and `AUTH`/`INVALID_*` cannot be fixed by trying again.
+ */
+export const RETRYABLE_FAILURE_CODES = Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TRANSPORT'])
+
 /** Cordis/Schemastery config schema: the loader validates and fills defaults before `apply`. */
 export const Config = {
   type: 'object',
@@ -83,6 +116,19 @@ export const Config = {
       items: { type: 'string' },
       description: 'Substrings or /regex/u literals matched against the request system prompt.',
       default: [AUTO_REVIEW_SYSTEM_PREFIX],
+    },
+    retryAttempts: {
+      type: 'integer',
+      minimum: 0,
+      maximum: MAX_RETRY_ATTEMPTS,
+      description: 'Retries after the first attempt of one review call. 0 disables retrying.',
+      default: DEFAULT_RETRY_ATTEMPTS,
+    },
+    retryDelayMs: {
+      type: 'integer',
+      minimum: 0,
+      description: 'Pause before each review retry, in milliseconds.',
+      default: DEFAULT_RETRY_DELAY_MS,
     },
     wrapPrepareCall: {
       type: 'boolean',
@@ -181,14 +227,134 @@ export function resolveConfig(raw = {}) {
   for (const [key, value] of Object.entries(booleans)) {
     if (typeof value !== 'boolean') throw new TypeError(`${key} must be a boolean, got ${typeof value}`)
   }
+  const retryAttempts = raw.retryAttempts ?? DEFAULT_RETRY_ATTEMPTS
+  if (!Number.isSafeInteger(retryAttempts) || retryAttempts < 0 || retryAttempts > MAX_RETRY_ATTEMPTS) {
+    throw new TypeError(`retryAttempts must be a safe integer between 0 and ${MAX_RETRY_ATTEMPTS}, got ${String(raw.retryAttempts)}`)
+  }
+  const retryDelayMs = raw.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
+  if (!Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0) {
+    throw new TypeError(`retryDelayMs must be a non-negative safe integer, got ${String(raw.retryDelayMs)}`)
+  }
   return {
     route,
     patterns: compiled,
+    retryAttempts,
+    retryDelayMs,
     wrapPrepareCall: booleans.wrapPrepareCall,
     dropReasoningEffort: booleans.dropReasoningEffort,
     dropMaxTokens: booleans.dropMaxTokens,
     logRetargets: booleans.logRetargets,
   }
+}
+
+/**
+ * Whether one stream failure is worth trying again.
+ * @param failure - the terminal failure of an attempt.
+ * @param signal - the request's cancellation signal.
+ * @returns true when the caller should retry.
+ */
+export function isRetryableFailure(failure, signal) {
+  if (signal?.aborted === true) return false
+  return RETRYABLE_FAILURE_CODES.includes(failure.code)
+}
+
+/** Wait `delayMs`, or resolve early when the signal aborts. */
+function cancellableDelay(delayMs, signal) {
+  if (delayMs <= 0) return Promise.resolve()
+  return new Promise(resolve => {
+    const timer = setTimeout(done, delayMs)
+    function done() {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
+
+/**
+ * Stream one review call with bounded retries.
+ *
+ * The built-in gate reaches `llm.stream` directly, outside the agent loop, so the
+ * harness's retry plugin (which is an `agent/request-error` listener) never sees
+ * a failed review: without this, one dropped connection denies the tool call.
+ *
+ * A failed attempt's terminal `finish` chunk is NOT yielded, because the gate's
+ * reader treats any terminal `finish` as the end of the review — emitting it
+ * would end the review on the first transport blip. Retryable failure codes are
+ * exactly the ones the harness itself treats as transient.
+ *
+ * Reasoning chunks of a failed attempt stay on the wire (the reader ignores
+ * reasoning content), so a retried review exposes more than one attempt's
+ * reasoning; the verdict is still parsed from the final text block alone.
+ *
+ * `start` MUST build a fresh attempt stream per call: an attempt stream is
+ * single-use, and a retry needs a new dispatch.
+ * @param start - builds one attempt from the request to dispatch.
+ * @param options - the request being dispatched; its signal bounds the retries.
+ * @param resolved - the resolved plugin config.
+ * @param warn - reports each retry.
+ * @returns the chunk stream of the first successful attempt, or of the last one.
+ */
+export async function* streamReviewWithRetry(start, options, resolved, warn) {
+  const attempts = resolved.retryAttempts + 1
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let failure
+    // The finish chunk of THIS attempt is held back until the attempt is known
+    // to be the last one, so a retried attempt cannot terminate the review. It
+    // is cleared per attempt, so a failure is never reported twice.
+    let lastFinish
+    for await (const chunk of start()) {
+      if (chunk.type !== 'finish') {
+        yield chunk
+        continue
+      }
+      if (chunk.reason.kind === 'stop' || chunk.reason.kind === 'tool-calls' || chunk.reason.kind === 'max-tokens') {
+        yield chunk
+        return
+      }
+      failure = chunk.reason.failure
+      lastFinish = chunk
+    }
+    if (failure === undefined || attempt === attempts || !isRetryableFailure(failure, options.signal)) {
+      if (lastFinish !== undefined) yield lastFinish
+      return
+    }
+    warn(`review attempt ${attempt}/${attempts} failed with ${failure.code}; retrying in ${resolved.retryDelayMs} ms`)
+    await cancellableDelay(resolved.retryDelayMs, options.signal)
+    if (options.signal?.aborted === true) {
+      yield lastFinish
+      return
+    }
+  }
+}
+
+/**
+ * Stream a rewritten review request, retrying transient failures when enabled.
+ * The route rewrite is owned by the innermost wrapper, so the retry loop lives
+ * here rather than around a chain of calls: if `llm.stream` is wrapped more than
+ * once (another plugin, or a re-mount whose predecessor has not disposed yet),
+ * the outer wrapper must not re-dispatch a stream the inner one already retried.
+ * {@link RETRYING_SIGNALS} carries that fact across the layers.
+ * @param dispatch - performs ONE dispatch of the rewritten request.
+ * @param options - the rewritten request; its `signal` bounds the retries.
+ * @param resolved - the resolved plugin config.
+ * @param warn - reports each retry.
+ * @returns the chunk stream the gate consumes.
+ */
+function reviewStream(dispatch, options, resolved, warn) {
+  const signal = options?.signal
+  const guarded = signal instanceof AbortSignal && RETRYING_SIGNALS.has(signal)
+  if (resolved.retryAttempts === 0 || guarded) return dispatch()
+  if (!(signal instanceof AbortSignal)) return streamReviewWithRetry(dispatch, options, resolved, warn)
+  RETRYING_SIGNALS.add(signal)
+  return (async function* retriedReview() {
+    try {
+      yield* streamReviewWithRetry(dispatch, options, resolved, warn)
+    } finally {
+      RETRYING_SIGNALS.delete(signal)
+    }
+  })()
 }
 
 /**
@@ -331,7 +497,9 @@ export function apply(ctx, rawConfig = {}) {
     const route = reviewRoute(options, resolved)
     if (route === undefined) return original.call(this, options)
     report(options, route, 'stream')
-    return original.call(this, retargetReviewOptions(options, route, resolved))
+    const retargeted = retargetReviewOptions(options, route, resolved)
+    const warn = message => ctx.logger?.warn?.(`${name}: ${message}`)
+    return reviewStream(() => original.call(this, retargeted), retargeted, resolved, warn)
   })
 
   if (!resolved.wrapPrepareCall) return
@@ -344,20 +512,23 @@ export function apply(ctx, rawConfig = {}) {
     const route = reviewRoute(config, resolved)
     if (route === undefined) return original.call(this, config, signal, configure)
     report(config, route, 'prepareCall')
-    const retargetedConfig = retargetReviewOptions(config, route, resolved)
     // The retargeted config must be prepared by the runtime itself: a prepared
     // handle refuses a dispatch config that differs from the one it resolved
     // (`INVALID_PREPARED_CALL`), so the route cannot be swapped afterwards.
+    const retargetedConfig = retargetReviewOptions(config, route, resolved)
     const prepared = await original.call(this, retargetedConfig, signal, configure)
+    const warn = message => ctx.logger?.warn?.(`${name}: ${message}`)
+    // A handle of this kind may be dispatched once, so the retry starts a fresh
+    // dispatch per attempt. A dispatch that still carries the review prompt — a
+    // caller that reused the config, or one that never passed it through
+    // prepareCall — is retargeted here too, where the runtime re-resolves the
+    // route from `options`.
+    const retargetedFor = options => isAutoReviewRequest(options, resolved.patterns)
+      ? retargetReviewOptions(options, route, resolved)
+      : options
     return {
       ...prepared,
-      // A prepared handle resolves the route at prepare time, so a dispatch that
-      // still carries the review prompt — a caller that reused the handle, or
-      // one that never passed the config through prepareCall — is retargeted at
-      // this last hop, where the runtime re-resolves the route from `options`.
-      stream: options => prepared.stream(isAutoReviewRequest(options, resolved.patterns)
-        ? retargetReviewOptions(options, route, resolved)
-        : options),
+      stream: options => reviewStream(() => prepared.stream(retargetedFor(options)), options, resolved, warn),
     }
   })
 }

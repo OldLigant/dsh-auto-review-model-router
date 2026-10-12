@@ -24,6 +24,11 @@ Plain ESM JavaScript, no build step, no runtime dependencies.
 - **Never keep a source-route control on a re-targeted request.**
   `reasoningEffort` and `maxTokens` belong to the source model;
   `UNSUPPORTED_REASONING_EFFORT` would fail every review closed.
+- **Retry only the harness-transient codes.** `TIMEOUT` is the adapter's idle
+  watchdog, so retrying it multiplies a silent wait. Hold back a failed attempt's
+  terminal `finish` chunk: the gate's reader ends the review on any terminal
+  `finish`. A request signal already inside a retry loop is dispatched once, so
+  stacked wrappers cannot multiply the attempt count.
 - **Wrap the owner, not the proxy.** `ctx.llm` is a per-read traceable proxy in
   which a property write is shadowed. `methodOwner()` walks the prototype chain to
   the object that actually holds the method.
@@ -53,7 +58,14 @@ which spawns a child process per file (blocked by confined shells on Windows).
 The plugin patches `LlmRuntime.prototype`, which is shared by every runtime in one
 process. Every live test must dispose its mount (`harness()` registers the
 disposal through `t.after`) or its wrapper leaks into the following test's
-dispatches and the expectations become order-dependent.
+dispatches and the expectations become order-dependent. `mount()` asserts that the
+plugin registered a disposal effect, so a test cannot silence that leak by
+registering an `undefined` teardown.
+
+A leaked wrapper made the retry cases fail only inside the full suite, which is
+how the leak was found: a test that mounts with defaults leaves `retryAttempts: 4`
+in the chain, so a later case configured with `retryAttempts: 0` still retried.
+`RETRYING_SIGNALS` keeps the plugin itself correct in that situation regardless.
 
 ## Publishing
 

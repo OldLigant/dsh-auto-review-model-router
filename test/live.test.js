@@ -62,6 +62,9 @@ function mount(ctx, config = {}) {
     },
   }
   apply(fake, { reviewModel: 'deepseek-official/deepseek-flash', ...config })
+  // A mount with no registered effect would leave a wrapper on the shared
+  // prototype for the rest of the process, so fail loudly instead of leaking.
+  assert.notEqual(disposers.length, 0, 'the plugin registered no disposal effect')
   return { logs, dispose: () => { for (const disposer of disposers) disposer() } }
 }
 
@@ -97,16 +100,25 @@ async function drain(llm, options) {
  *
  * The plugin wraps `LlmRuntime.prototype.stream`, and that prototype is shared
  * by every runtime in this process, so each test MUST dispose its mount (see
- * `mount` + `t.after`) or its wrapper leaks into the next test's dispatches.
- * @returns the runtime and the recorded dispatches and controls.
+ * `harness`) or its wrapper leaks into the next test's dispatches.
+ * @param failures - transient failure codes the adapter emits, one per dispatch,
+ *   before it starts succeeding.
+ * @returns the runtime, the recorded dispatches, and the adapter controls.
  */
-async function runtime() {
+async function runtime(failures = []) {
   const { Context } = await import(cordisUrl)
   const { LlmRuntime, LlmAdapter } = await import(llmUrl)
   const root = new Context()
   await root.plugin(LlmRuntime)
   const calls = []
   const seen = []
+  /** One terminal failure chunk for the given code. */
+  const failureFinish = code => ({
+    type: 'finish',
+    reason: code === 'ABORTED'
+      ? { kind: 'aborted', failure: { code, message: code } }
+      : { kind: 'error', failure: { code, message: code } },
+  })
   class RecordingAdapter extends LlmAdapter {
     providerInfo(provider) {
       return { id: provider, name: provider }
@@ -127,8 +139,14 @@ async function runtime() {
     async * stream(options) {
       calls.push({ provider: options.provider, model: options.model })
       seen.push({ reasoningEffort: options.reasoningEffort, maxTokens: options.maxTokens })
-      yield { type: 'block-start', index: 0, blockType: 'text' }
-      yield { type: 'block-end', index: 0, block: { type: 'text', text: '{"risk":"low","decision":"allow"}' } }
+      const code = failures.shift()
+      yield { type: 'reasoning-delta', index: 0, text: `attempt-${calls.length}` }
+      if (code !== undefined) {
+        yield failureFinish(code)
+        return
+      }
+      yield { type: 'block-start', index: 1, blockType: 'text' }
+      yield { type: 'block-end', index: 1, block: { type: 'text', text: '{"risk":"low","decision":"allow"}' } }
       yield { type: 'finish', reason: { kind: 'stop' } }
     }
   }
@@ -141,13 +159,21 @@ async function runtime() {
  * as a test teardown.
  * @param t - the running test, used to register the teardown.
  * @param config - plugin config; the review route is the deepseek default.
+ * @param failures - transient failure codes the adapter emits before succeeding.
  * @returns the runtime, the recorded dispatches, and the recorded log lines.
  */
-async function harness(t, config = {}) {
-  const runtimeParts = await runtime()
+async function harness(t, config = {}, failures = []) {
+  const runtimeParts = await runtime(failures)
   const { logs, dispose } = mount(runtimeParts.root, config)
   t.after(dispose)
   return { ...runtimeParts, logs, dispose }
+}
+
+/** Collect every chunk of one stream, so terminal finishes are observable. */
+async function collect(llm, options) {
+  const chunks = []
+  for await (const chunk of llm.stream(options)) chunks.push(chunk)
+  return chunks
 }
 
 test('a frozen review request is re-routed while the agent request is not', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
@@ -209,17 +235,12 @@ test('a service without a reachable stream method warns instead of failing the b
 
 test('the default route applies when the plugin is mounted without config', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
   const { root, calls } = await runtime()
-  let disposed
-  apply({
-    llm: root.llm,
-    logger: { info: () => {}, warn: () => {}, debug: () => {} },
-    effect: callback => {
-      disposed = callback()
-    },
-  })
-  t.after(disposed)
+  // Mounted with no config at all: the plugin's own defaults must be the route.
+  const { dispose } = mount(root)
+  t.after(dispose)
   await drain(root.llm, reviewRequest())
   assert.deepEqual(calls, [{ provider: 'deepseek-official', model: 'deepseek-flash' }])
+  dispose()
 })
 
 test('a review prepared through prepareCall dispatches on the review route', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
@@ -247,4 +268,68 @@ test('with wrapPrepareCall off, a prepared handle keeps the session route', { sk
 
   assert.deepEqual(calls, [{ provider: 'anthropic', model: 'claude-opus-4' }])
   assert.deepEqual(logs, [])
+})
+
+test('a transient review failure is retried until it succeeds', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
+  const { root, calls, logs } = await harness(t, { retryDelayMs: 0 }, ['TRANSPORT', 'SERVER'])
+
+  const chunks = await collect(root.llm, reviewRequest())
+
+  assert.equal(calls.length, 3, 'two transient failures plus the attempt that succeeds')
+  // Every attempt stays on the review route.
+  assert.deepEqual(new Set(calls.map(call => `${call.provider}/${call.model}`)), new Set(['deepseek-official/deepseek-flash']))
+  // The gate sees exactly one terminal finish, and it is the successful one.
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'finish'), [{ type: 'finish', reason: { kind: 'stop' } }])
+  assert.equal(chunks.some(chunk => chunk.type === 'finish' && chunk.reason.kind === 'error'), false)
+  assert.deepEqual(chunks.filter(chunk => chunk.type === 'block-end').map(chunk => chunk.block.text), ['{"risk":"low","decision":"allow"}'])
+  assert.deepEqual(logs.map(line => /attempt (\d+)\/(\d+)/u.exec(line)?.[0]).filter(Boolean), ['attempt 1/5', 'attempt 2/5'])
+})
+
+test('retries stop at the configured attempt count and surface the failure', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
+  const { root, calls } = await harness(t, { retryAttempts: 1, retryDelayMs: 0 }, ['TRANSPORT', 'TRANSPORT', 'TRANSPORT'])
+
+  const chunks = await collect(root.llm, reviewRequest())
+
+  assert.equal(calls.length, 2, 'one initial attempt plus the configured single retry')
+  assert.equal(chunks.at(-1).type, 'finish')
+  assert.deepEqual(chunks.at(-1).reason, { kind: 'error', failure: { code: 'TRANSPORT', message: 'TRANSPORT' } })
+})
+
+test('retryAttempts 0 dispatches once and never retries', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
+  const { root, calls } = await harness(t, { retryAttempts: 0 }, ['TRANSPORT'])
+
+  const chunks = await collect(root.llm, reviewRequest())
+
+  assert.equal(calls.length, 1)
+  assert.equal(chunks.at(-1).reason.kind, 'error')
+})
+
+test('a non-retryable failure is reported without another attempt', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
+  const { root, calls } = await harness(t, { retryDelayMs: 0 }, ['INVALID_CREDENTIAL'])
+
+  const chunks = await collect(root.llm, reviewRequest())
+
+  assert.equal(calls.length, 1, 'an unusable credential is not fixed by trying again')
+  assert.deepEqual(chunks.at(-1).reason, { kind: 'error', failure: { code: 'INVALID_CREDENTIAL', message: 'INVALID_CREDENTIAL' } })
+})
+
+test('an aborted attempt is not retried', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
+  const { root, calls } = await harness(t, { retryDelayMs: 0 }, ['ABORTED'])
+
+  const chunks = await collect(root.llm, reviewRequest())
+
+  assert.equal(calls.length, 1)
+  assert.deepEqual(chunks.at(-1).reason, { kind: 'aborted', failure: { code: 'ABORTED', message: 'ABORTED' } })
+})
+
+test('a cancelled signal stops the retry loop after the current attempt', { skip: cordisUrl === undefined || llmUrl === undefined }, async (t) => {
+  const { root, calls } = await harness(t, { retryDelayMs: 0 }, ['TRANSPORT', 'TRANSPORT'])
+  const controller = new AbortController()
+  controller.abort()
+
+  const chunks = await collect(root.llm, reviewRequest({ signal: controller.signal }))
+
+  assert.equal(calls.length, 1)
+  assert.equal(chunks.at(-1).type, 'finish')
+  assert.equal(chunks.at(-1).reason.kind, 'error')
 })

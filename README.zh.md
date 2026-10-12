@@ -37,6 +37,22 @@
    目标模型限制。两者都会让每次审查 fail closed。
 3. 其余部分——审查提示词、政策 system prompt、`temperature`，以及网关解析的
    `{"risk":…,"decision":…}` JSON 协议——完全不变。改变的只有产出裁决的模型。
+4. 因瞬时故障失败的审查会在同一路由上重试（`retryAttempts`，默认 4）。内置
+   auto-review 是直接调用 `llm.stream` 的、不经过 agent loop，所以 harness 的重试
+   插件（它监听 `agent/request-error`）看不到审查请求：没有这一步，一次连接中断
+   就会让工具调用被拒绝。
+
+### 重试为什么要单独分类
+
+只重试 harness 自己认定为瞬时的错误码：`EMPTY_RESPONSE`、`RATE_LIMIT`、`SERVER`、
+`TRANSPORT`。`TIMEOUT` 被刻意排除——DeepSeek 适配器是从**空闲看门狗**抛出它的，
+重试只会把静默等待乘以尝试次数，而 auto-review 的总超时在同时流逝。`ABORTED`
+（总超时，或调用方取消）以及 `AUTH` 之类的配置错误，重试也解决不了。
+
+失败尝试的终止 `finish` chunk 会被扣住不放：网关的读取端把任何终止 `finish` 都当作
+审查结束，放行它就会在第一次连接抖动时结束审查。推理 chunk 仍然实时透传（读取端
+忽略推理内容），因此重试后的审查会包含不止一次尝试的推理，而裁决依旧只从最后一次
+的文本块解析。
 
 ### 为什么是包装方法，而不是监听 `llm/stream`
 
@@ -95,10 +111,12 @@ pnpm add dsh-auto-review-model-router
 | --- | --- | --- |
 | `reviewModel` | `deepseek-official/deepseek-flash` | 审查统一使用的 `<provider>/<model>`。设为空字符串即关闭路由。 |
 | `systemPromptPatterns` | 已发布的 `REVIEW_POLICY` 开头 | 与请求 `system` 提示词匹配的子串，或 `/regex/u` 字面量。仅当某个 harness 版本改写了该提示词时才需要放宽。 |
+| `retryAttempts` | `4` | 单次审查在首次尝试之后的重试次数，即最多 5 次尝试。`0` 关闭重试，上限 10。 |
+| `retryDelayMs` | `500` | 每次重试前的等待毫秒数。 |
 | `wrapPrepareCall` | `true` | 一并路由通过 `llm.prepareCall` 发出的审查请求。 |
 | `dropReasoningEffort` | `true` | 在审查请求上丢弃源路由的 reasoning effort。 |
 | `dropMaxTokens` | `true` | 在审查请求上丢弃源路由的输出上限。 |
-| `logRetargets` | `true` | 记录每一次改写后的审查路由。 |
+| `logRetargets` | `true` | 记录每一次改写后的审查路由；重试始终以警告级别记录。 |
 
 ## 验证
 
@@ -117,10 +135,11 @@ DSH_PROFILE_DIR=<profile 目录> node test/live.test.js
 > 插件会改写 `LlmRuntime.prototype`，因此每个 live 用例都会释放自己的挂载；漏掉这步
 > 会让包装泄漏到下一个用例的分发里。
 
-运行时每次改写都会打印一行日志：
+运行时每次改写都会打印一行日志，每次重试会打印一条警告：
 
 ```
 auto-review-model-router: review request re-routed anthropic/claude-opus-4 -> deepseek-official/deepseek-flash (stream)
+auto-review-model-router: review attempt 1/5 failed with TRANSPORT; retrying in 500 ms
 ```
 
 ## 范围与限制

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.0
+
+- Retry transient review failures (`retryAttempts`, default 4, so up to 5
+  attempts; `retryDelayMs`, default 500). The built-in gate calls `llm.stream`
+  directly, outside the agent loop, so the harness retry plugin — an
+  `agent/request-error` listener — never sees a failed review: one dropped
+  connection used to deny the tool call outright.
+- Retry only the codes the harness itself treats as transient
+  (`EMPTY_RESPONSE`, `RATE_LIMIT`, `SERVER`, `TRANSPORT`). `TIMEOUT` is excluded
+  because the DeepSeek adapter raises it from an idle watchdog, so retrying it
+  multiplies a silent wait while the auto-review deadline drains.
+- Hold back a failed attempt's terminal `finish` chunk. The gate's reader ends
+  the review on any terminal `finish`, so yielding it would end the review on the
+  first transport blip. Reasoning chunks stay live; the verdict is still parsed
+  from the final text block alone.
+- Stop retrying when the request signal aborts, and never retry more than the
+  configured count even when `llm.stream` is wrapped more than once: a request
+  signal already inside a retry loop is dispatched once by the outer wrapper.
+
 ## 0.1.0
 
 Initial release.
