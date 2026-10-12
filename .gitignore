@@ -1,0 +1,12 @@
+# Dependencies and artifacts. This package has no build step: `index.js` is the
+# shipped module, so a fresh clone is immediately loadable by the DSH Loader.
+node_modules/
+lib/
+coverage/
+*.tsbuildinfo
+*.tgz
+.pnpm-store/
+dist/
+out/
+.DS_Store
+.playwright-mcp/

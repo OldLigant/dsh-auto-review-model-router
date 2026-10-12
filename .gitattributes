@@ -1,0 +1,6 @@
+# Line endings: developed on Windows, consumed on every platform. Force LF in
+# the index so CRLF/LF conversion never churns diffs.
+* text=auto eol=lf
+*.png binary
+*.gif binary
+*.tgz binary

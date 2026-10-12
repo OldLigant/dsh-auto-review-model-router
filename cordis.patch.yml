@@ -1,0 +1,10 @@
+# Inserted by this bundle. `config` is omitted so the plugin's own defaults
+# apply; override any field from your profile's cordis.patch.yml, e.g.
+#
+# - id: auto-review-model-router
+#   config:
+#     reviewModel: deepseek-official/deepseek-flash
+#
+- insert:
+    - id: auto-review-model-router
+      name: dsh-auto-review-model-router

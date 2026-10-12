@@ -1,0 +1,43 @@
+{
+  "name": "dsh-auto-review-model-router",
+  "version": "0.1.0",
+  "description": "Route DSH's experimental auto-review safety reviewer to a cheaper model: every review call is re-targeted to a configured provider/model while the agent's own route is untouched.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "README.zh.md",
+    ".github"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "auto-review",
+    "approval",
+    "llm",
+    "cost"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
