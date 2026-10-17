@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1
+
+- Declare `Config` as a Standard Schema. Cordis 4.0.5 (dsh 0.2.1) validates a
+  function plugin's `Config` through `Config['~standard'].validate(raw)` before
+  `apply`; the previous bare JSON Schema object carried no `~standard`, so the
+  loader threw `Cannot read properties of undefined (reading 'validate')` and
+  the row never mounted (`auto-review-model-router did not activate`). The JSON
+  Schema stays available as `Config.jsonSchema` for tooling, and `validate`
+  delegates to `resolveConfig` while returning the RAW config, which `apply`
+  resolves again — returning the resolved form would replace every configured
+  field with its default.
+
 ## 0.2.0
 
 - Retry transient review failures (`retryAttempts`, default 4, so up to 5

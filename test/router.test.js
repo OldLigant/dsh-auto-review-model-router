@@ -8,6 +8,7 @@ import { test } from 'node:test'
 
 import {
   AUTO_REVIEW_SYSTEM_PREFIX,
+  Config,
   RETRYABLE_FAILURE_CODES,
   TEST_UNMARKED_LOOP_MARK,
   compilePattern,
@@ -172,4 +173,22 @@ test('methodOwner finds the object owning a method up the prototype chain', () =
   // An own method belongs to the object itself, not to its prototype.
   const own = { stream() {} }
   assert.equal(methodOwner(own, 'stream'), own)
+})
+
+test('Config validates through Standard Schema and returns the raw config', () => {
+  const standard = Config['~standard']
+  assert.equal(standard.version, 1)
+  // Cordis 4.0.5 reads exactly this member; a bare JSON Schema object made the
+  // loader throw before `apply` ran.
+  assert.equal(typeof standard.validate, 'function')
+
+  const raw = { reviewModel: 'deepseek-official/deepseek-chat', retryAttempts: 2 }
+  const accepted = standard.validate(raw)
+  assert.equal(accepted.value, raw, 'the loader must receive the raw config, not the resolved form')
+  assert.deepEqual(standard.validate(undefined), { value: {} })
+  assert.deepEqual(standard.validate(), { value: {} })
+
+  const rejected = standard.validate({ retryAttempts: 99 })
+  assert.equal(rejected.value, undefined)
+  assert.match(rejected.issues[0].message, /between 0 and 10/u)
 })

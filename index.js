@@ -101,8 +101,12 @@ const RETRYING_SIGNALS = new WeakSet()
  */
 export const RETRYABLE_FAILURE_CODES = Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TRANSPORT'])
 
-/** Cordis/Schemastery config schema: the loader validates and fills defaults before `apply`. */
-export const Config = {
+/**
+ * JSON Schema of the accepted config fields. It stays beside the Standard
+ * Schema below so documentation and tooling still describe the knobs the
+ * loader accepts; Cordis itself reads only `~standard`.
+ */
+const CONFIG_SCHEMA = {
   type: 'object',
   additionalProperties: false,
   properties: {
@@ -149,6 +153,38 @@ export const Config = {
       type: 'boolean',
       description: 'Log every retargeted review request.',
       default: DEFAULT_LOG_RETARGETS,
+    },
+  },
+}
+
+/**
+ * Loader config schema. Cordis 4.0.5 (dsh 0.2.1) validates a function plugin's
+ * `Config` through Standard Schema — it reads `Config['~standard'].validate(raw)`
+ * and hands the returned value to `apply`. A bare JSON Schema object carries no
+ * `~standard`, so the loader threw before `apply` ever ran.
+ *
+ * `validate` delegates to this plugin's own {@link resolveConfig} and returns the
+ * RAW config: `apply` resolves it again, so returning the resolved form here
+ * would silently replace every configured field with its default.
+ */
+export const Config = {
+  /** Field documentation for tooling that reports a plugin's accepted keys. */
+  jsonSchema: CONFIG_SCHEMA,
+  '~standard': {
+    version: 1,
+    vendor: 'dsh-auto-review-model-router',
+    validate(value) {
+      try {
+        resolveConfig(value ?? {})
+      } catch (error) {
+        return {
+          issues: [{
+            message: error instanceof Error ? error.message : String(error),
+            path: [],
+          }],
+        }
+      }
+      return { value: value ?? {} }
     },
   },
 }
